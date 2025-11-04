@@ -12,7 +12,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 2.6.0 (Added precheck step)
+Version: 2.9.0 (Re-enables default topic configs)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -26,6 +26,7 @@ import json
 import yaml
 import logging
 import re
+import copy  # <-- Added for deepcopy
 from typing import Dict, Any, Optional, Tuple
 
 # Configure logging
@@ -43,11 +44,31 @@ SALT_EAUTH = Variable.get("salt_eauth", default_var="pam")
 DAC_TASK_TYPE = "topic_creation"
 REQUEST_TIMEOUT = 300
 
-# DEFAULT_CONFIG is now just for fallbacks for the runner
+# --- EDIT: Restored full DEFAULT_CONFIG ---
+# These are the defaults that will be used if a user provides no optional values
 DEFAULT_CONFIG = {
-    "bootstrap_servers": ["stg-hdpashique101:6667", "stg-hdpashique102:6667", "stg-hdpashique103:6667"],
+    "topic_name": "example.events.prod", # Will be overwritten by mandatory param
+    "partitions": 1,                     # Will be overwritten by mandatory param
+    "replication_factor": 1,             # Will be overwritten by mandatory param
+    "bootstrap_servers": ["stg-hdpashique101:6667"], # Will be overwritten by mandatory param
     "log_level": "INFO",
+    "monitoring": { # Will be overwritten by mandatory param
+        "opentsdb_url": "http://opentsdb-read-no-dp-limit.nixy.stg-drove.phonepe.nb6/api/query"
+    },
+    "config": {
+        "cleanup.policy": "delete",
+        "retention.ms": 604800000,
+        "retention.bytes": 10737418240,
+        "min.insync.replicas": 2,
+        "unclean.leader.election.enable": False,
+        "delete.retention.ms": 86400000,
+        "segment.ms": 604800000,
+        "segment.bytes": 1073741824,
+        "compression.type": "producer",
+        "max.message.bytes": 1048576
+    }
 }
+# --- END EDIT ---
 
 # ============================================================================
 # Helper Functions
@@ -117,6 +138,7 @@ def validate_numeric_value(value: Any, name: str, min_val: int = 1, max_val: Opt
 def task_validate_input(**context) -> Dict[str, Any]:
     """
     Task 1: Validate input configuration - SYNTAX ONLY.
+    Builds config by merging user params over a set of defaults.
     """
     logger.info("=" * 80)
     logger.info("TASK 1: Validate Input Configuration")
@@ -125,65 +147,80 @@ def task_validate_input(**context) -> Dict[str, Any]:
     params = context.get("params", {})
     logger.info(f"Received configuration from params: {json.dumps(params, indent=2)}")
 
-    config = {}
+    # --- EDIT: Start with a deep copy of the defaults ---
+    config = copy.deepcopy(DEFAULT_CONFIG)
     
-    # 1. Add Mandatory fields
+    # 1. Overwrite with Mandatory fields
     config["topic_name"] = params["topic_name"]
     config["partitions"] = params["partitions"]
     config["replication_factor"] = params["replication_factor"]
+    config["bootstrap_servers"] = params["bootstrap_servers"]
+    
+    # 2. Overwrite 'monitoring' block (OpenTSDB is mandatory)
+    config["monitoring"] = {
+        "opentsdb_url": params["opentsdb_url"]
+    }
+    
+    # 3. Add optional monitoring thresholds IF provided
+    disk_thresholds_config = {}
+    if params.get("disk_warning_percent") is not None:
+        disk_thresholds_config["warning_percent"] = params["disk_warning_percent"]
+    if params.get("disk_critical_gb") is not None:
+        disk_thresholds_config["critical_gb"] = params["disk_critical_gb"]
+    if disk_thresholds_config:
+        config["monitoring"]["disk_thresholds"] = disk_thresholds_config
 
-    # 2. Add Optional "cluster" fields IF provided, else use default
-    if params.get("bootstrap_servers"):
-        config["bootstrap_servers"] = params["bootstrap_servers"]
-    else:
-        config["bootstrap_servers"] = DEFAULT_CONFIG["bootstrap_servers"]
-        logger.info("User did not provide 'bootstrap_servers', using default for runner.")
-
+    # 4. Overwrite 'log_level' IF provided
     if params.get("log_level") is not None and params.get("log_level") != "":
         config["log_level"] = params["log_level"]
-    else:
-        config["log_level"] = DEFAULT_CONFIG["log_level"]
-        logger.info("User did not provide 'log_level', using default for runner.")
-
-    # 3. Build the nested 'config' dict ONLY with user-provided optional values
-    config_dict = {}
+    
+    # 5. Overwrite nested 'config' dict ONLY with user-provided optional values
+    user_topic_configs = {}
     if params.get("retention_ms") is not None:
-        config_dict["retention.ms"] = params["retention_ms"]
+        user_topic_configs["retention.ms"] = params["retention_ms"]
     if params.get("retention_bytes") is not None:
-        config_dict["retention.bytes"] = params["retention_bytes"]
+        user_topic_configs["retention.bytes"] = params["retention_bytes"]
     if params.get("min_insync_replicas") is not None:
-        config_dict["min.insync.replicas"] = params["min_insync_replicas"]
+        user_topic_configs["min.insync.replicas"] = params["min_insync_replicas"]
     if params.get("segment_ms") is not None:
-        config_dict["segment.ms"] = params["segment_ms"]
+        user_topic_configs["segment.ms"] = params["segment_ms"]
     if params.get("segment_bytes") is not None:
-        config_dict["segment.bytes"] = params["segment_bytes"]
+        user_topic_configs["segment.bytes"] = params["segment_bytes"]
     if params.get("max_message_bytes") is not None:
-        config_dict["max.message.bytes"] = params["max_message_bytes"]
+        user_topic_configs["max.message.bytes"] = params["max_message_bytes"]
     if params.get("unclean_leader_election") is not None:
-        config_dict["unclean.leader.election.enable"] = params["unclean_leader_election"]
+        user_topic_configs["unclean.leader.election.enable"] = params["unclean_leader_election"]
     if params.get("compression_type") is not None and params.get("compression_type") != "":
-        config_dict["compression.type"] = params["compression_type"]
+        user_topic_configs["compression.type"] = params["compression_type"]
     if params.get("cleanup_policy") is not None and params.get("cleanup_policy") != "":
-        config_dict["cleanup.policy"] = params["cleanup_policy"]
+        user_topic_configs["cleanup.policy"] = params["cleanup_policy"]
 
-    config["config"] = config_dict
+    # Merge the user-provided topic configs over the default topic configs
+    if user_topic_configs:
+        logger.info(f"User overrides for topic config: {json.dumps(user_topic_configs, indent=2)}")
+        config["config"].update(user_topic_configs)
+    
+    # --- End of new logic ---
 
+    # Log what configuration will be used
     logger.info("")
-    logger.info("Final configuration to be executed:")
+    logger.info("Final configuration to be executed (Defaults merged with User Input):")
     logger.info(f"  Topic Name: {config['topic_name']}")
     logger.info(f"  Partitions: {config['partitions']}")
     logger.info(f"  Replication Factor: {config['replication_factor']}")
     logger.info(f"  Bootstrap Servers: {config['bootstrap_servers']}")
     logger.info(f"  Log Level: {config.get('log_level', 'INFO')}")
     logger.info("  Topic Configs:")
-    if config["config"]:
-        for k, v in config["config"].items():
-            logger.info(f"    {k}: {v}")
-    else:
-        logger.info("    (None provided, will use broker defaults)")
+    for k, v in config["config"].items():
+        logger.info(f"    {k}: {v}")
+    logger.info("  Monitoring Config:")
+    for k, v in config["monitoring"].items():
+        logger.info(f"    {k}: {v}")
     logger.info("")
 
+    # --- Run Validations ---
     errors = []
+    
     is_valid, error = validate_topic_name(config.get("topic_name", ""))
     if not is_valid: errors.append(f"Topic name: {error}")
 
@@ -195,11 +232,10 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     bootstrap_servers = config.get("bootstrap_servers", [])
     if not bootstrap_servers or not isinstance(bootstrap_servers, list) or len(bootstrap_servers) == 0:
-        errors.append("Bootstrap servers must be a non-empty list")
-    else:
-        for server in bootstrap_servers:
-            if ':' not in str(server):
-                errors.append(f"Invalid bootstrap server format: {server} (expected host:port)")
+        errors.append("Bootstrap Servers are mandatory and must be a non-empty list.")
+    
+    if not config.get("monitoring", {}).get("opentsdb_url"):
+        errors.append("OpenTSDB URL is mandatory.")
 
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -229,6 +265,7 @@ def task_generate_yaml(**context) -> str:
     if not config:
         raise AirflowException("Failed to retrieve validated configuration")
 
+    # Build YAML structure
     yaml_config = {
         "topic": {
             "name": config["topic_name"],
@@ -238,7 +275,8 @@ def task_generate_yaml(**context) -> str:
         "cluster": {
             "bootstrap_servers": config["bootstrap_servers"]
         },
-        "config": config["config"]
+        "config": config["config"],
+        "monitoring": config["monitoring"]
     }
 
     yaml_str = yaml.dump(yaml_config, default_flow_style=False, sort_keys=False)
@@ -294,7 +332,7 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
             "task_type": DAC_TASK_TYPE,
             "yaml_content": yaml_content,
             "log_level": log_level,
-            "dry_run": dry_run  # This will be mapped to --precheck by the runner
+            "dry_run": dry_run
         }
     }
 
@@ -323,13 +361,11 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
         logger.info(json.dumps(result, indent=2))
         logger.info("=" * 80)
 
-        # Push result to a unique XCom key
         if dry_run:
             context["task_instance"].xcom_push(key="salt_precheck_result", value=result)
         else:
             context["task_instance"].xcom_push(key="salt_execute_result", value=result)
 
-        # Check precheck success
         if dry_run:
             try:
                 return_data = result["return"][0]
@@ -382,7 +418,6 @@ def task_verify_result(**context) -> Dict[str, Any]:
     logger.info("=" * 80)
 
     ti = context["task_instance"]
-    # Pull from the EXECUTE task
     salt_result = ti.xcom_pull(task_ids="execute_creation", key="salt_execute_result")
 
     if not salt_result:
@@ -489,8 +524,6 @@ def task_generate_report(**context) -> None:
     # Parse Final Output
     script_output = verification_result.get("stdout") or verification_result.get("stderr", "N/A")
 
-
-    # Use print() for clean report formatting in logs
     print("╔" + "=" * 78 + "╗")
     print("║" + " KAFKA TOPIC CREATION REPORT ".center(78) + "║")
     print("╚" + "=" * 78 + "╝")
@@ -498,14 +531,22 @@ def task_generate_report(**context) -> None:
     print(f"  Topic Name:         {topic_name}")
     print(f"  Partitions:         {partitions}")
     print(f"  Replication Factor: {rf}")
-    print(f"  Bootstrap Servers:  {len(validated_config.get('bootstrap_servers', []))}")
+    print(f"  Bootstrap Servers:  {validated_config.get('bootstrap_servers', [])}")
     print("")
-    print("  Topic Configs Provided (others will use broker defaults):")
+    print("  Topic Configs Provided (others are defaults):")
     if validated_config.get("config"):
         for k, v in validated_config["config"].items():
             print(f"    {k}: {v}")
     else:
-        print("    (None provided, using all broker defaults)")
+        print("    (Using all broker defaults)")
+    
+    print("")
+    print("  Monitoring Config Provided:")
+    if validated_config.get("monitoring"):
+        for k, v in validated_config["monitoring"].items():
+            print(f"    {k}: {v}")
+    else:
+        print("    (Validation Error, should be present)")
     print("")
     print("─" * 80)
     print("")
@@ -573,14 +614,19 @@ dag = DAG(
             description="Number of replicas per partition (typically 3 for production)",
             minimum=1,
         ),
+        "bootstrap_servers": Param(
+            type="array",
+            title="Bootstrap Servers (Mandatory)",
+            description="List of Kafka broker addresses (e.g., ['host1:6667', 'host2:6667']).",
+        ),
+        "opentsdb_url": Param(
+            type="string",
+            title="OpenTSDB URL (Mandatory)",
+            description="URL for disk usage monitoring (e.g., http://opentsdb.example.com:4242).",
+            minLength=1
+        ),
 
         # ==================== OPTIONAL (Cluster) ====================
-        "bootstrap_servers": Param(
-            default=None,
-            type=["array", "null"],
-            title="Bootstrap Servers (Optional)",
-            description="Default: ['stg-hdpashique101:6667', ...]. Override if needed.",
-        ),
         "log_level": Param(
             default="",
             type=["string", "null"],
@@ -589,62 +635,76 @@ dag = DAG(
             enum=["", "DEBUG", "INFO", "WARNING", "ERROR"],
         ),
 
+        # ==================== OPTIONAL (Monitoring) ====================
+        "disk_warning_percent": Param(
+            default=None,
+            type=["integer", "null"],
+            title="Disk Warning % (Optional)",
+            description="Default: (script default, e.g., 85). Warn if disk usage exceeds this.",
+        ),
+        "disk_critical_gb": Param(
+            default=None,
+            type=["integer", "null"],
+            title="Disk Critical GB (Optional)",
+            description="Default: (script default, e.g., 10). Warn if free space is less than this.",
+        ),
+        
         # ==================== OPTIONAL (Topic Configs) ====================
         "retention_ms": Param(
             default=None,
             type=["integer", "null"],
             title="Retention Time (ms) (Optional)",
-            description="Default: (uses broker default, e.g., 604800000).",
+            description="Default: (uses default config, e.g., 604800000).",
         ),
         "retention_bytes": Param(
             default=None,
             type=["integer", "null"],
             title="Retention Size (bytes) (Optional)",
-            description="Default: (uses broker default, e.g., 10737418240).",
+            description="Default: (uses default config, e.g., 10737418240).",
         ),
         "min_insync_replicas": Param(
             default=None,
             type=["integer", "null"],
             title="Min In-Sync Replicas (Optional)",
-            description="Default: (uses broker default, e.g., 2).",
+            description="Default: (uses default config, e.g., 2).",
         ),
         "compression_type": Param(
             default="",
             type=["string", "null"],
             title="Compression Type (Optional)",
-            description="Default: (uses broker default, e.g., producer)",
+            description="Default: (uses default config, e.g., producer)",
             enum=["", "uncompressed", "gzip", "snappy", "lz4", "zstd", "producer"],
         ),
         "cleanup_policy": Param(
             default="",
             type=["string", "null"],
             title="Cleanup Policy (Optional)",
-            description="Default: (uses broker default, e.g., delete)",
+            description="Default: (uses default config, e.g., delete)",
             enum=["", "delete", "compact", "delete,compact"],
         ),
         "segment_ms": Param(
             default=None,
             type=["integer", "null"],
             title="Segment Roll Time (ms) (Optional)",
-            description="Default: (uses broker default, e.g., 604800000).",
+            description="Default: (uses default config, e.g., 604800000).",
         ),
         "segment_bytes": Param(
             default=None,
             type=["integer", "null"],
             title="Segment Size (bytes) (Optional)",
-            description="Default: (uses broker default, e.g., 1073741824).",
+            description="Default: (uses default config, e.g., 1073741824).",
         ),
         "max_message_bytes": Param(
             default=None,
             type=["integer", "null"],
             title="Max Message Size (bytes) (Optional)",
-            description="Default: (uses broker default, e.g., 1048576).",
+            description="Default: (uses default config, e.g., 1048576).",
         ),
         "unclean_leader_election": Param(
             default=None,
             type=["boolean", "null"],
             title="Unclean Leader Election (Optional)",
-            description="Default: (uses broker default, e.g., False).",
+            description="Default: (uses default config, e.g., False).",
         ),
     },
 )
@@ -662,21 +722,19 @@ generate_yaml = PythonOperator(
     dag=dag,
 )
 
-# --- NEW: Split execute task into precheck and execute ---
 run_precheck = PythonOperator(
     task_id="run_precheck",
     python_callable=_execute_salt_task,
-    op_kwargs={"dry_run": True},  # dry_run=True maps to --precheck in the runner
+    op_kwargs={"dry_run": True},
     dag=dag,
 )
 
 execute_creation = PythonOperator(
     task_id="execute_creation",
     python_callable=_execute_salt_task,
-    op_kwargs={"dry_run": False}, # dry_run=False runs the normal command
+    op_kwargs={"dry_run": False},
     dag=dag,
 )
-# --- END NEW ---
 
 verify_result = PythonOperator(
     task_id="verify_result",
@@ -691,6 +749,5 @@ generate_report = PythonOperator(
     dag=dag,
 )
 
-# --- Define new task dependencies ---
-# Flow: validate → generate → precheck → execute → verify → report
+# --- Define task dependencies ---
 validate_input >> generate_yaml >> run_precheck >> execute_creation >> verify_result >> generate_report

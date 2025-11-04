@@ -4,7 +4,7 @@ Airflow DAG for Kafka Topic Alteration via Salt-Stack
 Restructured with clear separation of concerns and a dry-run step.
 
 Tasks:
-1. validate_input - Validates user configuration
+1. validate_input - Validates user configuration (opentsdb is now a string URL)
 2. generate_yaml - Converts config to YAML string for the alteration script
 3. precheck - Executes the alteration script in --dry-run mode
 4. execute_alteration - Performs the actual execution via Salt
@@ -12,7 +12,7 @@ Tasks:
 6. generate_report - Creates final report (includes dry-run output)
 
 Author: DevOps Team
-Version: 3.3.1 (Renamed dry-run task)
+Version: 3.5.0 (Changed OpenTSDB param to simple string URL)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 
 Note: This DAG calls the 'topic_alteration' task in the Salt Runner.
@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "topic_name": "example.events.prod",
     "bootstrap_servers": ["stg-hdpashique101:6667", "stg-hdpashique102:6667", "stg-hdpashique103:6667"],
     "log_level": "INFO",
+    "opentsdb_url": "http://opentsdb-read.example.com/api/query", # Added example
     "alteration": {
         "partitions": {
             "target": None
@@ -71,7 +72,7 @@ DEFAULT_CONFIG = {
 # Helper Functions
 # ============================================================================
 
-def _log_multiline(output_string: str, prefix: str = "  > "):
+def _log_multiline(output_string: str, prefix: str = "   > "):
     """
     Helper to print a multiline string for readable Airflow logs.
     Uses print() to avoid double-logging prefixes and
@@ -154,6 +155,7 @@ def task_validate_input(**context) -> Dict[str, Any]:
         "topic_name": params.get("topic_name"),
         "bootstrap_servers": params.get("bootstrap_servers"),
         "log_level": params.get("log_level", "INFO"),
+        "opentsdb_url": params.get("opentsdb_url"), # <-- MODIFIED: Changed to opentsdb_url
         "alteration": {
             "partitions": {},
             "retention": {},
@@ -192,6 +194,17 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     # --- Run Validations ---
     errors = []
+
+    # --- MODIFIED: OpenTSDB URL Validation ---
+    opentsdb_url = config.get("opentsdb_url")
+    if not opentsdb_url:
+        errors.append("OpenTSDB URL ('opentsdb_url') is mandatory and was not provided.")
+    elif not isinstance(opentsdb_url, str) or len(opentsdb_url) == 0:
+        errors.append("OpenTSDB URL must be a non-empty string.")
+    elif not (opentsdb_url.startswith("http://") or opentsdb_url.startswith("https://")):
+        errors.append(f"OpenTSDB URL must be a valid URL (starting with http:// or https://), but got: {opentsdb_url}")
+    # --- END MODIFIED ---
+
 
     # 1. Topic name
     is_valid, error = validate_topic_name(config.get("topic_name", ""))
@@ -236,6 +249,7 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     logger.info("✓ All syntax validations passed")
     logger.info(f"Topic: {config['topic_name']}")
+    logger.info(f"OpenTSDB URL: {config['opentsdb_url']}") # MODIFIED: Updated log
     logger.info(f"Target Partitions: {config['alteration']['partitions'].get('target', 'N/A')}")
     logger.info(f"New Retention: {config['alteration']['retention'].get('new', 'N/A')}")
     logger.info(f"Other Configs: {json.dumps(config['alteration']['other_configs'])}")
@@ -278,6 +292,11 @@ def task_generate_yaml(**context) -> str:
             "name": config["topic_name"],
             "bootstrap_servers": config["bootstrap_servers"]
         },
+        # --- MODIFIED: Build opentsdb dict from opentsdb_url string ---
+        "opentsdb": {
+            "url": config["opentsdb_url"]
+        },
+        # --- END MODIFIED ---
         "alteration": {}
     }
 
@@ -451,6 +470,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
 
     logger.info("Parsing final execution Salt response...")
 
+
     try:
         if "return" not in salt_result or not salt_result["return"]:
             raise AirflowException("Invalid Salt API response format - missing 'return' key or empty")
@@ -502,6 +522,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
         context["task_instance"].xcom_push(key="verification_result", value=verification_result)
 
         return verification_result
+
 
     except Exception as e:
         logger.error(f"Unexpected error parsing Salt response: {e}")
@@ -567,6 +588,10 @@ def task_generate_report(**context) -> None:
     print("")
     print(f"  Topic Name: {topic_name}")
     print(f"  Bootstrap Servers: {len(validated_config.get('bootstrap_servers', []))}")
+    # --- MODIFIED: Added opentsdb_url to report ---
+    if validated_config.get("opentsdb_url"):
+        print(f"  OpenTSDB URL: {validated_config['opentsdb_url']}")
+    # --- END MODIFIED ---
     print("")
     print("  Alterations Requested:")
 
@@ -582,7 +607,7 @@ def task_generate_report(**context) -> None:
 
     print("─" * 80)
     print("")
-    print(f"  Final Status:  {status}")
+    print(f"  Final Status:   {status}")
     print(f"  Final Message: {message}")
     print("")
 
@@ -646,6 +671,15 @@ dag = DAG(
             title="Script Log Level",
             enum=["DEBUG", "INFO", "WARNING", "ERROR"],
         ),
+
+        # --- MODIFIED: Changed OpenTSDB to a simple URL string ---
+        "opentsdb_url": Param(
+            type="string",
+            title="OpenTSDB URL (Mandatory)",
+            description='MANDATORY: OpenTSDB API endpoint (e.g., "http://opentsdb-read-no-dp-limit.nixy.stg-drove.phonepe.nb6/api/query")',
+            # No 'default' makes it required; validation task will check
+        ),
+        # --- END MODIFIED ---
 
         # ==================== Alteration: Partitions ====================
         "target_partitions": Param(
@@ -732,6 +766,7 @@ precheck = PythonOperator(
     dag=dag,
 )
 # --- EDIT END ---
+
 
 execute_alteration = PythonOperator(
     task_id="execute_alteration",
