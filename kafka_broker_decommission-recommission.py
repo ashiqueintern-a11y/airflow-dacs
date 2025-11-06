@@ -1,19 +1,19 @@
 """
-Airflow DAG for Kafka Partition Skewness Balancing
-==================================================
-Runs the partition balancing script via Salt-Stack.
-Now includes Ambari & Salt credentials from Airflow Connections.
+Airflow DAG for Kafka Node Rotation (Decommission/Recommission)
+================================================================
+Orchestrates broker decommission or recommission via Salt-Stack.
+Now uses Airflow Connections for Salt and Ambari credentials.
 
 Tasks:
 1. validate_input - Validates user inputs & Ambari connection
 2. generate_yaml - Converts config to YAML string for the script
-3. pre_checks_and_dry_run_balance - Executes the script in --dry-run mode
-4. execute_balance - Performs the actual execution with --execute --monitor --verify
+3. pre_checks_and_dry_run_action - Executes the script in --dry-run mode
+4. execute_action - Performs the actual decommission/recommission via Salt
 5. verify_result - Verifies the final execution result
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.3.0 (Moved Salt credentials to connection)
+Version: 1.4.0 (Moved all credentials to Connections)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -37,23 +37,22 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-# --- MODIFIED: Removed Salt Variable.get() lines ---
+# --- MODIFIED: Credentials are now pulled from Connections ---
 # SALT_MASTER_URL = Variable.get(...)
 # SALT_API_USERNAME = Variable.get(...)
 # SALT_API_PASSWORD = Variable.get(...)
 # SALT_EAUTH = Variable.get(...)
-
-# --- MODIFIED FOR PARTITION SKEWNESS ---
-DAC_TASK_TYPE = "partition_skewness"
-# --- END MODIFICATION ---
 
 # --- NEW: Airflow Connection IDs ---
 AMBARI_CONN_ID = "ambari_default"
 SALT_CONN_ID = "salt_api_default"
 # --- END NEW ---
 
-# Set a long timeout, as balancing can take hours
-REQUEST_TIMEOUT = 7200  # 2 hours
+# --- MODIFIED FOR NODE ROTATION ---
+DAC_TASK_TYPE = "node_rotation"
+# --- END MODIFICATION ---
+
+REQUEST_TIMEOUT = 900  # Increased to 15 mins for long-running (re)decommissions
 
 # ============================================================================
 # Helper Functions (for log readability)
@@ -89,10 +88,10 @@ def _log_multiline(output_string: str, prefix: str = "  > "):
 
 def task_validate_input(**context) -> Dict[str, Any]:
     """
-    Task 1: Validate input, fetch Ambari credentials, and build the nested YAML.
+    Task 1: Validate input, fetch Ambari credentials, and build YAML config.
     """
     logger.info("=" * 80)
-    logger.info("TASK 1: Validate Input Configuration (Partition Skewness)")
+    logger.info("TASK 1: Validate Input Configuration (Node Rotation)")
     logger.info("=" * 80)
 
     params = context.get("params", {})
@@ -100,11 +99,27 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     errors = []
     
-    # 1. Validate Required Params
-    if not params.get("bootstrap_servers"):
-        errors.append("Bootstrap Servers are required.")
-    if not params.get("opentsdb_url"):
-        errors.append("OpenTSDB URL is required.")
+    # 1. Validate Broker ID or Hostname
+    broker_target = params.get("broker_target")
+    if not broker_target:
+        errors.append("Broker ID or Hostname is required.")
+
+    # 2. Validate Action
+    action = params.get("action")
+    if not action or action not in ["decommission", "recommission"]:
+        errors.append(f"Invalid action. Must be one of: decommission, recommission.")
+
+    # 3. Validate Bootstrap Servers
+    bootstrap_servers = params.get("bootstrap_servers")
+    if not bootstrap_servers or ':' not in bootstrap_servers:
+        errors.append("Bootstrap Servers are required and must be in 'host:port' or 'host1:port,host2:port' format.")
+
+    # 4. Validate OpenTSDB URL
+    opentsdb_url = params.get("opentsdb_url")
+    if not opentsdb_url:
+        errors.append("OpenTSDB URL is now mandatory.")
+    elif not (opentsdb_url.startswith("http://") or opentsdb_url.startswith("https://")):
+         errors.append("OpenTSDB URL must be a valid URL (e.g., http://opentsdb.example.com:4242).")
 
     # --- NEW: Get Ambari Connection ---
     ambari_conn = None
@@ -129,7 +144,6 @@ def task_validate_input(**context) -> Dict[str, Any]:
         try:
             extras = ambari_conn.extra_dejson
             ambari_config["cluster"] = extras.get("cluster")
-            # Use 300 from your example as default, but allow override from Extras
             ambari_config["timeout"] = extras.get("timeout", 300) 
             
             if not ambari_config["cluster"]:
@@ -152,53 +166,40 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     logger.info("✓ All syntax validations passed")
 
-    # Build the nested YAML config
-    yaml_config = {
-        "ambari": {
-            "host": ambari_config.get("host"),
-            "user": ambari_config.get("user"),
-            "password": ambari_config.get("password"),
-            "cluster": ambari_config.get("cluster"),
-            "timeout": ambari_config.get("timeout")
-        },
-        "kafka": {
-            "bootstrap_servers": params["bootstrap_servers"]
-        },
-        "opentsdb": {
-            "url": params["opentsdb_url"],
-            "metrics": {
-                "cpu": params.get("opentsdb_metric_cpu", "cpu.field.usage_idle"),
-                "disk": params.get("opentsdb_metric_disk", "disk.field.used_percent")
-            }
-        },
-        "thresholds": {
-            "skew_percent": params.get("skew_percent", 15.0),
-            "replica_skew_percent": params.get("replica_skew_percent", 20.0),
-            "disk_max_percent": params.get("disk_max_percent", 85.0),
-            "disk_max_diff_percent": params.get("disk_max_diff_percent", 20.0)
-        },
-        "reassignment": {
-            # Convert throttle from MB/s to B/s
-            "throttle_bytes_per_sec": int(params.get("throttle_mb_per_sec", 100) * 1024 * 1024),
-            "batch_size": params.get("batch_size", 50),
-            "batch_wait_seconds": params.get("batch_wait_seconds", 60)
-        },
-        "advanced": {
-            "leader_election_max_retries": params.get("leader_election_max_retries", 2),
-            "leader_election_wait_seconds": params.get("leader_election_wait_seconds", 30),
-            "tolerance_percent": params.get("tolerance_percent", 15.0)
+    validated_config = {
+        "yaml_config": {},
+        "runner_kwargs": {
+            "broker_id": str(broker_target),
+            "action": action,
+            "log_level": params.get("log_level", "INFO")
         }
     }
 
-    # Runner kwargs are simple, just log_level
-    runner_kwargs = {
-        "log_level": params.get("log_level", "INFO")
+    # Build the YAML config dictionary
+    yaml_config = validated_config["yaml_config"]
+    
+    # --- NEW: Add ambari section ---
+    yaml_config["ambari"] = {
+        "host": ambari_config.get("host"),
+        "user": ambari_config.get("user"),
+        "password": ambari_config.get("password"),
+        "cluster": ambari_config.get("cluster"),
+        "timeout": ambari_config.get("timeout")
     }
+    # --- END NEW ---
+    
+    yaml_config["bootstrap_servers"] = bootstrap_servers
+    yaml_config["opentsdb_url"] = opentsdb_url
 
-    validated_config = {
-        "yaml_config": yaml_config,
-        "runner_kwargs": runner_kwargs
-    }
+    # Add optional params to YAML only if they are set
+    if params.get("state_directory"):
+        yaml_config["state_directory"] = params["state_directory"]
+    if params.get("cpu_threshold"):
+        yaml_config["cpu_threshold"] = params["cpu_threshold"]
+    if params.get("disk_threshold"):
+        yaml_config["disk_threshold"] = params["disk_threshold"]
+    
+    logger.info(f"Action: {action.upper()} on Broker: {broker_target}")
     
     context["task_instance"].xcom_push(key="validated_config", value=validated_config)
     
@@ -295,7 +296,6 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
         "dry_run": dry_run
     }
     
-    # Add runner_kwargs (e.g., log_level)
     payload_kwargs.update(runner_kwargs)
     
     # --- MODIFIED: Use new connection variables ---
@@ -393,7 +393,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
     logger.info("=" * 80)
 
     ti = context["task_instance"]
-    salt_result = ti.xcom_pull(task_ids="execute_balance", key="salt_execute_result") # Changed task_id
+    salt_result = ti.xcom_pull(task_ids="execute_action", key="salt_execute_result")
 
     if not salt_result:
         raise AirflowException("Failed to retrieve Salt execution result")
@@ -440,7 +440,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
                 print("\n--- Final Execution Script Output (Failure) ---")
                 _log_multiline(script_output)
                 print("-------------------------------------------------\n")
-            raise AirflowException(f"Partition balancing failed: {verification_result['message']}")
+            raise AirflowException(f"Node rotation failed: {verification_result['message']}")
         
         context["task_instance"].xcom_push(key="verification_result", value=verification_result)
         return verification_result
@@ -469,13 +469,14 @@ def task_generate_report(**context) -> None:
     ti = context["task_instance"]
     
     validated_config = ti.xcom_pull(task_ids="validate_input", key="validated_config")
-    dry_run_salt_result = ti.xcom_pull(task_ids="pre_checks_and_dry_run_balance", key="salt_dry_run_result")
+    dry_run_salt_result = ti.xcom_pull(task_ids="pre_checks_and_dry_run_action", key="salt_dry_run_result")
     verification_result = ti.xcom_pull(task_ids="verify_result", key="verification_result")
 
     if not validated_config:
         logger.warning("Could not retrieve validated config for report.")
         return
 
+    runner_kwargs = validated_config.get("runner_kwargs", {})
     yaml_config = validated_config.get("yaml_config", {})
 
     # Parse Dry-Run Output
@@ -502,15 +503,21 @@ def task_generate_report(**context) -> None:
 
     # --- Use print() for readable report ---
     print("╔" + "=" * 78 + "╗")
-    print("║" + " KAFKA PARTITION SKEWNESS REPORT ".center(78) + "║")
+    print("║" + " KAFKA NODE ROTATION REPORT ".center(78) + "║")
     print("╚" + "=" * 78 + "╝")
     print("")
+    print("  Operation Details:")
+    print(f"    - Broker: {runner_kwargs.get('broker_id', 'N/A')}")
+    print(f"    - Action:   {runner_kwargs.get('action', 'N/A').upper()}")
+    print("")
     print("  Configuration:")
+    # --- NEW: Added ambari_host to report ---
     print(f"    - ambari_host: {yaml_config.get('ambari', {}).get('host', 'N/A')}")
-    print(f"    - bootstrap_servers: {yaml_config.get('kafka', {}).get('bootstrap_servers', 'N/A')}")
-    print(f"    - opentsdb_url: {yaml_config.get('opentsdb', {}).get('url', 'N/A')}")
-    print(f"    - skew_percent: {yaml_config.get('thresholds', {}).get('skew_percent', 'N/A')}%")
-    print(f"    - throttle: {yaml_config.get('reassignment', {}).get('throttle_bytes_per_sec', 0) / 1024 / 1024:.0f} MB/s")
+    # --- END NEW ---
+    print(f"    - bootstrap_servers: {yaml_config.get('bootstrap_servers', 'N/A')}")
+    print(f"    - opentsdb_url: {yaml_config.get('opentsdb_url', 'N/A')}")
+    if yaml_config.get('state_directory'):
+        print(f"    - state_directory: {yaml_config['state_directory']}")
 
     print("─" * 80)
     print("")
@@ -518,20 +525,20 @@ def task_generate_report(**context) -> None:
     print(f"  Final Message: {message}")
     print("")
 
-    print("  Dry-Run Output (Summary):")
+    print("  Dry-Run Output:")
     print("  " + "-" * 76)
     _log_multiline(dry_run_output, prefix="  ")
     print("")
 
     if status == "✓ SUCCESS":
-        print("  Final Execution Output (Summary):")
+        print("  Final Execution Output:")
         print("  " + "-" * 76)
         _log_multiline(final_output, prefix="  ")
         print("")
     
     print("═" * 80)
     print(f"Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("═"* 80)
+    print("═" * 80)
 
 
 # ============================================================================
@@ -549,105 +556,61 @@ default_args = {
 }
 
 dag = DAG(
-    "kafka_partition_skewness_via_salt",
+    "kafka_node_rotation_via_salt",
     default_args=default_args,
-    description="Run Kafka partition balancing for skewness via Salt-Stack",
+    description="Decommission or Recommission a Kafka broker via Salt-Stack",
     schedule=None,
     catchup=False,
-    tags=["kafka", "salt", "dac", "partition-skewness", "balancing"],
+    tags=["kafka", "salt", "dac", "node-rotation", "decommission"],
 
     params={
-        # ==================== Required Config ====================
+        # ==================== Main Action ====================
         # Ambari & Salt params are now fetched from connections
+        "broker_target": Param(
+            type="string",
+            title="Broker ID or Hostname",
+            description="The numeric ID (e.g., 1001) or FQDN (e.g., host.example.com) of the broker.",
+        ),
+        "action": Param(
+            default="decommission",
+            type="string",
+            title="Action",
+            description="The action to perform on the broker.",
+            enum=["decommission", "recommission"],
+        ),
+        
+        # ==================== Required Config ====================
         "bootstrap_servers": Param(
             default="stg-hdpashique101:6667",
             type="string",
             title="Bootstrap Servers",
             description="Comma-separated list of Kafka brokers (e.g., host1:port,host2:port).",
         ),
+        
         "opentsdb_url": Param(
-            default="http://opentsdb-read-no-dp-limit.nixy.stg-drove.phonepe.nb6",
             type="string",
-            title="OpenTSDB URL",
-            description="URL for CPU/Disk monitoring (e.g., http://opentsdb.example.com:4242).",
+            title="OpenTSDB URL (Required)",
+            description="URL for CPU monitoring (e.g., http://opentsdb.example.com:4242). This is required.",
         ),
         
-        # ==================== Reassignment Config ====================
-        "throttle_mb_per_sec": Param(
-            default=100,
-            type="integer",
-            title="Throttle (MB/s)",
-            description="Reassignment throttle in Megabytes per second.",
-            minimum=1,
-        ),
-        "batch_size": Param(
-            default=50,
-            type="integer",
-            title="Batch Size",
-            description="Number of partitions to move in a single batch.",
-            minimum=1,
-        ),
-        "batch_wait_seconds": Param(
-            default=60,
-            type="integer",
-            title="Batch Wait (seconds)",
-            description="Time to wait between reassignment batches.",
-            minimum=1,
-        ),
-
-        # ==================== Thresholds ====================
-        "skew_percent": Param(
-            default=15.0,
-            type="number",
-            title="Skew Threshold %",
-            description="Leader skew percentage to trigger balancing.",
-        ),
-        "replica_skew_percent": Param(
-            default=20.0,
-            type="number",
-            title="Replica Skew Threshold %",
-            description="Replica skew percentage to trigger balancing.",
-        ),
-        "disk_max_percent": Param(
-            default=85.0,
-            type="number",
-            title="Max Disk Threshold %",
-            description="Brokers above this usage will be avoided.",
-        ),
-        "disk_max_diff_percent": Param(
-            default=20.0,
-            type="number",
-            title="Max Disk Difference %",
-            description="Max allowed disk usage difference between brokers.",
-        ),
-
-        # ==================== Advanced ====================
-        "leader_election_max_retries": Param(
-            default=2,
-            type="integer",
-            title="Leader Election Retries",
-        ),
-        "leader_election_wait_seconds": Param(
-            default=30,
-            type="integer",
-            title="Leader Election Wait (sec)",
-        ),
-        "tolerance_percent": Param(
-            default=15.0,
-            type="number",
-            title="Tolerance %",
-        ),
-
         # ==================== Optional Overrides ====================
-        "opentsdb_metric_cpu": Param(
-            default="cpu.field.usage_idle",
-            type="string",
-            title="OpenTSDB CPU Metric (Optional)",
+        "state_directory": Param(
+            default="/data/kafka_demotion_state",
+            type=["string", "null"],
+            title="State Directory (Optional)",
+            description="Path to store decommission state files.",
         ),
-        "opentsdb_metric_disk": Param(
-            default="disk.field.used_percent",
-            type="string",
-            title="OpenTSDB Disk Metric (Optional)",
+        "cpu_threshold": Param(
+            default=80.0,
+            type=["number", "null"],
+            title="CPU Threshold % (Optional)",
+            description="Max CPU for leader selection (default: 80).",
+        ),
+        "disk_threshold": Param(
+            default=85.0,
+            type=["number", "null"],
+            title="Disk Threshold % (Optional)",
+            description="Max disk usage for leader selection (default: 85).",
         ),
         "log_level": Param(
             default="INFO",
@@ -672,15 +635,15 @@ generate_yaml = PythonOperator(
     dag=dag,
 )
 
-pre_checks_and_dry_run_balance = PythonOperator(
-    task_id="pre_checks_and_dry_run_balance",
+pre_checks_and_dry_run_action = PythonOperator(
+    task_id="pre_checks_and_dry_run_action",
     python_callable=_execute_salt_task,
     op_kwargs={"dry_run": True},
     dag=dag,
 )
 
-execute_balance = PythonOperator(
-    task_id="execute_balance",
+execute_action = PythonOperator(
+    task_id="execute_action",
     python_callable=_execute_salt_task,
     op_kwargs={"dry_run": False},
     dag=dag,
@@ -700,4 +663,4 @@ generate_report = PythonOperator(
 )
 
 # --- Define task dependencies ---
-validate_input >> generate_yaml >> pre_checks_and_dry_run_balance >> execute_balance >> verify_result >> generate_report
+validate_input >> generate_yaml >> pre_checks_and_dry_run_action >> execute_action >> verify_result >> generate_report

@@ -6,13 +6,13 @@ Runs the partition balancing script via Salt-Stack.
 Tasks:
 1. validate_input - Validates user inputs
 2. generate_yaml - Converts config to YAML string for the script
-3. dry_run_balance - Executes the script in --dry-run mode
+3. pre_checks_and_dry_run_balance - Executes the script in --dry-run mode
 4. execute_balance - Performs the actual execution with --execute --monitor --verify
 5. verify_result - Verifies the final execution result
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.0.0
+Version: 1.1.0 (Task rename)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -394,7 +394,9 @@ def task_generate_report(**context) -> None:
     ti = context["task_instance"]
     
     validated_config = ti.xcom_pull(task_ids="validate_input", key="validated_config")
-    dry_run_salt_result = ti.xcom_pull(task_ids="dry_run_balance", key="salt_dry_run_result") # Changed task_id
+    # --- MODIFIED: Use new task ID for xcom_pull ---
+    dry_run_salt_result = ti.xcom_pull(task_ids="pre_checks_and_dry_run_balance", key="salt_dry_run_result")
+    # --- END MODIFICATION ---
     verification_result = ti.xcom_pull(task_ids="verify_result", key="verification_result")
 
     if not validated_config:
@@ -595,12 +597,14 @@ generate_yaml = PythonOperator(
     dag=dag,
 )
 
-dry_run_balance = PythonOperator(
-    task_id="dry_run_balance",
+# --- MODIFIED: Renamed task variable and task_id ---
+pre_checks_and_dry_run_balance = PythonOperator(
+    task_id="pre_checks_and_dry_run_balance",
     python_callable=_execute_salt_task,
     op_kwargs={"dry_run": True},
     dag=dag,
 )
+# --- END MODIFICATION ---
 
 execute_balance = PythonOperator(
     task_id="execute_balance",
@@ -623,4 +627,6 @@ generate_report = PythonOperator(
 )
 
 # --- Define task dependencies ---
-validate_input >> generate_yaml >> dry_run_balance >> execute_balance >> verify_result >> generate_report
+# --- MODIFIED: Use new task name in chain ---
+validate_input >> generate_yaml >> pre_checks_and_dry_run_balance >> execute_balance >> verify_result >> generate_report
+# --- END MODIFICATION ---
