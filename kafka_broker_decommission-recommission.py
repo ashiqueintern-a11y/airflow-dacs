@@ -4,7 +4,7 @@ Airflow DAG for Kafka Node Rotation (Decommission/Recommission)
 Orchestrates broker decommission or recommission via Salt-Stack.
 
 Tasks:
-1. validate_input - Validates user inputs (Broker ID, Action, Config)
+1. validate_input - Validates user inputs (Broker ID/Hostname, Action, Config)
 2. generate_yaml - Converts config to YAML string for the script
 3. dry_run_action - Executes the script in --dry-run mode
 4. execute_action - Performs the actual decommission/recommission via Salt
@@ -12,7 +12,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.1.0 (Removed rollback option)
+Version: 1.2.0 (Accepts Broker ID or Hostname)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -91,12 +91,12 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     errors = []
     
-    # 1. Validate Broker ID
-    broker_id = params.get("broker_id")
-    if not broker_id:
-        errors.append("Broker ID is required.")
-    elif not re.match(r'^\d+$', str(broker_id)):
-         errors.append(f"Broker ID must be a number (e.g., '1001'). Received: '{broker_id}'")
+    # 1. Validate Broker ID or Hostname
+    # --- EDIT START: Changed broker_id to broker_target ---
+    broker_target = params.get("broker_target")
+    if not broker_target:
+        errors.append("Broker ID or Hostname is required.")
+    # --- EDIT END: Removed the regex check for numbers ---
 
     # 2. Validate Action
     action = params.get("action")
@@ -120,7 +120,12 @@ def task_validate_input(**context) -> Dict[str, Any]:
     validated_config = {
         "yaml_config": {},
         "runner_kwargs": {
-            "broker_id": str(broker_id),
+            # --- EDIT START: Pass the target to the 'broker_id' kwarg ---
+            # The Salt runner function 'kafka_runner.run_dac_task'
+            # still expects the 'broker_id' kwarg, but now we pass
+            # it either an ID or a hostname.
+            "broker_id": str(broker_target),
+            # --- EDIT END ---
             "action": action,
             "log_level": params.get("log_level", "INFO")
         }
@@ -140,7 +145,9 @@ def task_validate_input(**context) -> Dict[str, Any]:
     if params.get("disk_threshold"):
         yaml_config["disk_threshold"] = params["disk_threshold"]
     
-    logger.info(f"Action: {action.upper()} on Broker ID: {broker_id}")
+    # --- EDIT START: Updated log message ---
+    logger.info(f"Action: {action.upper()} on Broker: {broker_target}")
+    # --- EDIT END ---
     
     context["task_instance"].xcom_push(key="validated_config", value=validated_config)
     
@@ -427,8 +434,10 @@ def task_generate_report(**context) -> None:
     print("╚" + "=" * 78 + "╝")
     print("")
     print("  Operation Details:")
-    print(f"    - Broker ID: {runner_kwargs.get('broker_id', 'N/A')}")
-    print(f"    - Action:    {runner_kwargs.get('action', 'N/A').upper()}")
+    # --- EDIT START: Updated label ---
+    print(f"    - Broker: {runner_kwargs.get('broker_id', 'N/A')}")
+    # --- EDIT END ---
+    print(f"    - Action:   {runner_kwargs.get('action', 'N/A').upper()}")
     print("")
     print("  Configuration:")
     print(f"    - bootstrap_servers: {yaml_config.get('bootstrap_servers', 'N/A')}")
@@ -483,11 +492,13 @@ dag = DAG(
 
     params={
         # ==================== Main Action ====================
-        "broker_id": Param(
+        # --- EDIT START: Changed broker_id to broker_target ---
+        "broker_target": Param(
             type="string",
-            title="Broker ID",
-            description="The numeric ID of the broker to act on (e.g., 1001).",
+            title="Broker ID or Hostname",
+            description="The numeric ID (e.g., 1001) or FQDN (e.g., host.example.com) of the broker.",
         ),
+        # --- EDIT END ---
         "action": Param(
             default="decommission",
             type="string",
