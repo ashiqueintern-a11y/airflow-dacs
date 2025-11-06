@@ -2,9 +2,10 @@
 Airflow DAG for Kafka Partition Skewness Balancing
 ==================================================
 Runs the partition balancing script via Salt-Stack.
+Now includes Ambari & Salt credentials from Airflow Connections.
 
 Tasks:
-1. validate_input - Validates user inputs
+1. validate_input - Validates user inputs & Ambari connection
 2. generate_yaml - Converts config to YAML string for the script
 3. pre_checks_and_dry_run_balance - Executes the script in --dry-run mode
 4. execute_balance - Performs the actual execution with --execute --monitor --verify
@@ -12,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.1.0 (Task rename)
+Version: 1.3.0 (Moved Salt credentials to connection)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -20,6 +21,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable, Param
 from airflow.exceptions import AirflowException
+from airflow.hooks.base import BaseHook  # <-- IMPORTED
 from datetime import datetime, timedelta
 import requests
 import json
@@ -35,14 +37,20 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-SALT_MASTER_URL = Variable.get("salt_master_url", default_var="http://stg-hdpashique105.phonepe.nb6:8000")
-SALT_API_USERNAME = Variable.get("salt_api_username", default_var="saltapi")
-SALT_API_PASSWORD = Variable.get("salt_api_password", default_var="password")
-SALT_EAUTH = Variable.get("salt_eauth", default_var="pam")
+# --- MODIFIED: Removed Salt Variable.get() lines ---
+# SALT_MASTER_URL = Variable.get(...)
+# SALT_API_USERNAME = Variable.get(...)
+# SALT_API_PASSWORD = Variable.get(...)
+# SALT_EAUTH = Variable.get(...)
 
 # --- MODIFIED FOR PARTITION SKEWNESS ---
 DAC_TASK_TYPE = "partition_skewness"
 # --- END MODIFICATION ---
+
+# --- NEW: Airflow Connection IDs ---
+AMBARI_CONN_ID = "ambari_default"
+SALT_CONN_ID = "salt_api_default"
+# --- END NEW ---
 
 # Set a long timeout, as balancing can take hours
 REQUEST_TIMEOUT = 7200  # 2 hours
@@ -81,7 +89,7 @@ def _log_multiline(output_string: str, prefix: str = "  > "):
 
 def task_validate_input(**context) -> Dict[str, Any]:
     """
-    Task 1: Validate input and build the nested YAML structure.
+    Task 1: Validate input, fetch Ambari credentials, and build the nested YAML.
     """
     logger.info("=" * 80)
     logger.info("TASK 1: Validate Input Configuration (Partition Skewness)")
@@ -92,11 +100,50 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     errors = []
     
-    # 1. Validate Required Fields
+    # 1. Validate Required Params
     if not params.get("bootstrap_servers"):
         errors.append("Bootstrap Servers are required.")
     if not params.get("opentsdb_url"):
         errors.append("OpenTSDB URL is required.")
+
+    # --- NEW: Get Ambari Connection ---
+    ambari_conn = None
+    ambari_config = {}
+    try:
+        ambari_conn = BaseHook.get_connection(AMBARI_CONN_ID)
+        logger.info(f"Successfully retrieved Airflow connection: {AMBARI_CONN_ID}")
+        
+        # Basic fields
+        ambari_config["user"] = ambari_conn.login
+        ambari_config["password"] = ambari_conn.password
+        
+        # Build host with port
+        if ambari_conn.host and ambari_conn.port:
+            ambari_config["host"] = f"{ambari_conn.host}:{ambari_conn.port}"
+        elif ambari_conn.host:
+             ambari_config["host"] = ambari_conn.host
+        else:
+            errors.append(f"Connection '{AMBARI_CONN_ID}' is missing the 'Host' field.")
+        
+        # Extras field (JSON)
+        try:
+            extras = ambari_conn.extra_dejson
+            ambari_config["cluster"] = extras.get("cluster")
+            # Use 300 from your example as default, but allow override from Extras
+            ambari_config["timeout"] = extras.get("timeout", 300) 
+            
+            if not ambari_config["cluster"]:
+                 errors.append(f"Connection '{AMBARI_CONN_ID}' 'Extras' field is missing 'cluster'.")
+        except Exception as e:
+            errors.append(f"Failed to parse 'Extras' JSON from connection '{AMBARI_CONN_ID}': {e}")
+            
+        # Check for missing credentials
+        if not (ambari_config.get("user") and ambari_config.get("password")):
+             errors.append(f"Connection '{AMBARI_CONN_ID}' is missing 'Login' or 'Password'.")
+
+    except AirflowException:
+        errors.append(f"Airflow Connection '{AMBARI_CONN_ID}' not found. Please create it in the Admin > Connections panel.")
+    # --- END NEW ---
 
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -107,6 +154,13 @@ def task_validate_input(**context) -> Dict[str, Any]:
 
     # Build the nested YAML config
     yaml_config = {
+        "ambari": {
+            "host": ambari_config.get("host"),
+            "user": ambari_config.get("user"),
+            "password": ambari_config.get("password"),
+            "cluster": ambari_config.get("cluster"),
+            "timeout": ambari_config.get("timeout")
+        },
         "kafka": {
             "bootstrap_servers": params["bootstrap_servers"]
         },
@@ -194,6 +248,7 @@ def task_generate_yaml(**context) -> str:
 def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     """
     Reusable function to execute a task on Salt.
+    Fetches credentials from Airflow Connection 'salt_api_default'.
     """
     task_name = "Dry-Run" if dry_run else "Execute"
     logger.info("=" * 80)
@@ -207,13 +262,31 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     
     if not yaml_content or not runner_kwargs:
         raise AirflowException("Failed to retrieve YAML content or runner kwargs")
+
+    # --- NEW: Fetch Salt Connection ---
+    logger.info(f"Fetching Salt API credentials from connection: {SALT_CONN_ID}")
+    try:
+        salt_conn = BaseHook.get_connection(SALT_CONN_ID)
+        # get_uri() builds "http://host:port" or "https://host:port"
+        api_url = salt_conn.get_uri() + "/run"  
+        salt_api_username = salt_conn.login
+        salt_api_password = salt_conn.password
+        # Get eauth from 'Extras' field, default to 'pam'
+        salt_eauth = salt_conn.extra_dejson.get("eauth", "pam") 
+
+        if not (salt_conn.host and salt_api_username and salt_api_password):
+            raise AirflowException("Connection is missing required fields (Host, Login, Password).")
+            
+    except Exception as e:
+        logger.error(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+        raise AirflowException(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+    # --- END NEW ---
     
     logger.info(f"Task Type: {DAC_TASK_TYPE}")
     logger.info(f"Dry Run Mode: {dry_run}")
     logger.info(f"Runner Kwargs: {runner_kwargs}")
 
     # Build Salt API payload
-    api_url = f"{SALT_MASTER_URL}/run"
     headers = {"Content-Type": "application/json"}
 
     payload_kwargs = {
@@ -225,14 +298,16 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     # Add runner_kwargs (e.g., log_level)
     payload_kwargs.update(runner_kwargs)
     
+    # --- MODIFIED: Use new connection variables ---
     payload = {
-        "username": SALT_API_USERNAME,
-        "password": SALT_API_PASSWORD,
-        "eauth": SALT_EAUTH,
+        "username": salt_api_username,
+        "password": salt_api_password,
+        "eauth": salt_eauth,
         "client": "runner",
         "fun": "kafka_runner.run_dac_task",
         "kwarg": payload_kwargs
     }
+    # --- END MODIFIED ---
 
     logger.info(f"Calling Salt API: {api_url}")
     logger.info(f"Payload function: {payload['fun']}")
@@ -394,9 +469,7 @@ def task_generate_report(**context) -> None:
     ti = context["task_instance"]
     
     validated_config = ti.xcom_pull(task_ids="validate_input", key="validated_config")
-    # --- MODIFIED: Use new task ID for xcom_pull ---
     dry_run_salt_result = ti.xcom_pull(task_ids="pre_checks_and_dry_run_balance", key="salt_dry_run_result")
-    # --- END MODIFICATION ---
     verification_result = ti.xcom_pull(task_ids="verify_result", key="verification_result")
 
     if not validated_config:
@@ -433,6 +506,7 @@ def task_generate_report(**context) -> None:
     print("╚" + "=" * 78 + "╝")
     print("")
     print("  Configuration:")
+    print(f"    - ambari_host: {yaml_config.get('ambari', {}).get('host', 'N/A')}")
     print(f"    - bootstrap_servers: {yaml_config.get('kafka', {}).get('bootstrap_servers', 'N/A')}")
     print(f"    - opentsdb_url: {yaml_config.get('opentsdb', {}).get('url', 'N/A')}")
     print(f"    - skew_percent: {yaml_config.get('thresholds', {}).get('skew_percent', 'N/A')}%")
@@ -457,7 +531,7 @@ def task_generate_report(**context) -> None:
     
     print("═" * 80)
     print(f"Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("═" * 80)
+    print("═"* 80)
 
 
 # ============================================================================
@@ -484,6 +558,7 @@ dag = DAG(
 
     params={
         # ==================== Required Config ====================
+        # Ambari & Salt params are now fetched from connections
         "bootstrap_servers": Param(
             default="stg-hdpashique101:6667",
             type="string",
@@ -597,14 +672,12 @@ generate_yaml = PythonOperator(
     dag=dag,
 )
 
-# --- MODIFIED: Renamed task variable and task_id ---
 pre_checks_and_dry_run_balance = PythonOperator(
     task_id="pre_checks_and_dry_run_balance",
     python_callable=_execute_salt_task,
     op_kwargs={"dry_run": True},
     dag=dag,
 )
-# --- END MODIFICATION ---
 
 execute_balance = PythonOperator(
     task_id="execute_balance",
@@ -627,6 +700,4 @@ generate_report = PythonOperator(
 )
 
 # --- Define task dependencies ---
-# --- MODIFIED: Use new task name in chain ---
 validate_input >> generate_yaml >> pre_checks_and_dry_run_balance >> execute_balance >> verify_result >> generate_report
-# --- END MODIFICATION ---
