@@ -2,6 +2,7 @@
 Airflow DAG for Kafka Partition Skewness Balancing
 ==================================================
 Runs the partition balancing script via Salt-Stack.
+Now includes Salt credentials from Airflow Connections.
 
 Tasks:
 1. validate_input - Validates user inputs
@@ -12,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.1.0 (Task rename)
+Version: 1.5.0 (Fixed InvalidSchema error for connections)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -20,6 +21,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable, Param
 from airflow.exceptions import AirflowException
+from airflow.hooks.base import BaseHook  # <-- IMPORTED
 from datetime import datetime, timedelta
 import requests
 import json
@@ -35,14 +37,13 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-SALT_MASTER_URL = Variable.get("salt_master_url", default_var="http://stg-hdpashique105.phonepe.nb6:8000")
-SALT_API_USERNAME = Variable.get("salt_api_username", default_var="saltapi")
-SALT_API_PASSWORD = Variable.get("salt_api_password", default_var="password")
-SALT_EAUTH = Variable.get("salt_eauth", default_var="pam")
-
 # --- MODIFIED FOR PARTITION SKEWNESS ---
 DAC_TASK_TYPE = "partition_skewness"
 # --- END MODIFICATION ---
+
+# --- NEW: Airflow Connection ID ---
+SALT_CONN_ID = "salt_api_default"
+# --- END NEW ---
 
 # Set a long timeout, as balancing can take hours
 REQUEST_TIMEOUT = 7200  # 2 hours
@@ -194,6 +195,7 @@ def task_generate_yaml(**context) -> str:
 def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     """
     Reusable function to execute a task on Salt.
+    Fetches credentials from Airflow Connection 'salt_api_default'.
     """
     task_name = "Dry-Run" if dry_run else "Execute"
     logger.info("=" * 80)
@@ -207,13 +209,35 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     
     if not yaml_content or not runner_kwargs:
         raise AirflowException("Failed to retrieve YAML content or runner kwargs")
+
+    # --- NEW: Fetch Salt Connection ---
+    logger.info(f"Fetching Salt API credentials from connection: {SALT_CONN_ID}")
+    try:
+        salt_conn = BaseHook.get_connection(SALT_CONN_ID)
+        
+        # --- MODIFICATION: Manually build URL to fix InvalidSchema error ---
+        # This forces the http:// prefix regardless of Conn Type
+        api_url = f"http://{salt_conn.host}:{salt_conn.port}/run"
+        # --- END MODIFICATION ---
+        
+        salt_api_username = salt_conn.login
+        salt_api_password = salt_conn.password
+        # Get eauth from 'Extras' field, default to 'pam'
+        salt_eauth = salt_conn.extra_dejson.get("eauth", "pam") 
+
+        if not (salt_conn.host and salt_api_username and salt_api_password):
+            raise AirflowException("Connection is missing required fields (Host, Login, Password).")
+            
+    except Exception as e:
+        logger.error(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+        raise AirflowException(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+    # --- END NEW ---
     
     logger.info(f"Task Type: {DAC_TASK_TYPE}")
     logger.info(f"Dry Run Mode: {dry_run}")
     logger.info(f"Runner Kwargs: {runner_kwargs}")
 
     # Build Salt API payload
-    api_url = f"{SALT_MASTER_URL}/run"
     headers = {"Content-Type": "application/json"}
 
     payload_kwargs = {
@@ -225,14 +249,16 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     # Add runner_kwargs (e.g., log_level)
     payload_kwargs.update(runner_kwargs)
     
+    # --- MODIFIED: Use new connection variables ---
     payload = {
-        "username": SALT_API_USERNAME,
-        "password": SALT_API_PASSWORD,
-        "eauth": SALT_EAUTH,
+        "username": salt_api_username,
+        "password": salt_api_password,
+        "eauth": salt_eauth,
         "client": "runner",
         "fun": "kafka_runner.run_dac_task",
         "kwarg": payload_kwargs
     }
+    # --- END MODIFIED ---
 
     logger.info(f"Calling Salt API: {api_url}")
     logger.info(f"Payload function: {payload['fun']}")
@@ -484,6 +510,7 @@ dag = DAG(
 
     params={
         # ==================== Required Config ====================
+        # Salt params are now fetched from connection 'salt_api_default'
         "bootstrap_servers": Param(
             default="stg-hdpashique101:6667",
             type="string",

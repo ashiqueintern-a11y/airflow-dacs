@@ -13,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.4.0 (Moved all credentials to Connections)
+Version: 1.5.0 (Fixed InvalidSchema error for connections)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -36,12 +36,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Configuration Constants
 # ============================================================================
-
-# --- MODIFIED: Credentials are now pulled from Connections ---
-# SALT_MASTER_URL = Variable.get(...)
-# SALT_API_USERNAME = Variable.get(...)
-# SALT_API_PASSWORD = Variable.get(...)
-# SALT_EAUTH = Variable.get(...)
 
 # --- NEW: Airflow Connection IDs ---
 AMBARI_CONN_ID = "ambari_default"
@@ -268,8 +262,12 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     logger.info(f"Fetching Salt API credentials from connection: {SALT_CONN_ID}")
     try:
         salt_conn = BaseHook.get_connection(SALT_CONN_ID)
-        # get_uri() builds "http://host:port" or "https://host:port"
-        api_url = salt_conn.get_uri() + "/run"  
+        
+        # --- MODIFICATION: Manually build URL to fix InvalidSchema error ---
+        # This forces the http:// prefix regardless of Conn Type
+        api_url = f"http://{salt_conn.host}:{salt_conn.port}/run"
+        # --- END MODIFICATION ---
+          
         salt_api_username = salt_conn.login
         salt_api_password = salt_conn.password
         # Get eauth from 'Extras' field, default to 'pam'

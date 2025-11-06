@@ -2,6 +2,7 @@
 Airflow DAG for Kafka Topic Creation via Salt-Stack (Modular Version)
 ======================================================================
 Restructured with clear separation of concerns for better manageability.
+Now uses Airflow Connections for Salt credentials.
 
 Tasks:
 1. validate_input - Validates user configuration
@@ -12,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 2.9.0 (Re-enables default topic configs)
+Version: 3.0.0 (Moved Salt credentials to connection)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -20,6 +21,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable, Param
 from airflow.exceptions import AirflowException
+from airflow.hooks.base import BaseHook  # <-- IMPORTED
 from datetime import datetime, timedelta
 import requests
 import json
@@ -36,10 +38,15 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-SALT_MASTER_URL = Variable.get("salt_master_url", default_var="http://stg-hdpashique105.phonepe.nb6:8000")
-SALT_API_USERNAME = Variable.get("salt_api_username", default_var="saltapi")
-SALT_API_PASSWORD = Variable.get("salt_api_password", default_var="password")
-SALT_EAUTH = Variable.get("salt_eauth", default_var="pam")
+# --- MODIFIED: Removed Salt Variable.get() lines ---
+# SALT_MASTER_URL = Variable.get(...)
+# SALT_API_USERNAME = Variable.get(...)
+# SALT_API_PASSWORD = Variable.get(...)
+# SALT_EAUTH = Variable.get(...)
+
+# --- NEW: Airflow Connection ID ---
+SALT_CONN_ID = "salt_api_default"
+# --- END NEW ---
 
 DAC_TASK_TYPE = "topic_creation"
 REQUEST_TIMEOUT = 300
@@ -300,6 +307,7 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     """
     Reusable function to execute a task on Salt.
     Maps `dry_run=True` to `--precheck` for this task.
+    Fetches credentials from Airflow Connection 'salt_api_default'.
     """
     task_name = "Precheck" if dry_run else "Execute"
     
@@ -315,17 +323,39 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
     if not yaml_content:
         raise AirflowException("Failed to retrieve YAML configuration")
 
+    # --- NEW: Fetch Salt Connection ---
+    logger.info(f"Fetching Salt API credentials from connection: {SALT_CONN_ID}")
+    try:
+        salt_conn = BaseHook.get_connection(SALT_CONN_ID)
+        
+        # --- MODIFICATION: Manually build URL to fix InvalidSchema error ---
+        # This forces the http:// prefix regardless of Conn Type
+        api_url = f"http://{salt_conn.host}:{salt_conn.port}/run"
+        # --- END MODIFICATION ---
+          
+        salt_api_username = salt_conn.login
+        salt_api_password = salt_conn.password
+        # Get eauth from 'Extras' field, default to 'pam'
+        salt_eauth = salt_conn.extra_dejson.get("eauth", "pam") 
+
+        if not (salt_conn.host and salt_api_username and salt_api_password):
+            raise AirflowException("Connection is missing required fields (Host, Login, Password).")
+            
+    except Exception as e:
+        logger.error(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+        raise AirflowException(f"Failed to get Airflow Connection '{SALT_CONN_ID}': {e}")
+    # --- END NEW ---
+
     logger.info(f"Task Type: {DAC_TASK_TYPE}")
     logger.info(f"Log Level: {log_level}")
     logger.info(f"Precheck Mode (dry_run): {dry_run}")
 
-    api_url = f"{SALT_MASTER_URL}/run"
     headers = {"Content-Type": "application/json"}
 
     payload = {
-        "username": SALT_API_USERNAME,
-        "password": SALT_API_PASSWORD,
-        "eauth": SALT_EAUTH,
+        "username": salt_api_username,
+        "password": salt_api_password,
+        "eauth": salt_eauth,
         "client": "runner",
         "fun": "kafka_runner.run_dac_task",
         "kwarg": {
@@ -478,7 +508,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
         logger.error(f"Unexpected error parsing Salt response: {e}")
         logger.error(f"Full Salt result: {json.dumps(salt_result, indent=2)}")
         if not isinstance(e, AirflowException):
-            raise AirflowException(f"Failed to verify Salt execution: {str(e)}")
+            raise AirFlowException(f"Failed to verify Salt execution: {str(e)}")
         else:
             raise e
 
@@ -594,6 +624,7 @@ dag = DAG(
     tags=["kafka", "salt", "dac", "topic-creation", "modular"],
     params={
         # ==================== MANDATORY ====================
+        # Salt params are now fetched from connection 'salt_api_default'
         "topic_name": Param(
             type="string",
             title="Topic Name (Mandatory)",
