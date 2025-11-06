@@ -13,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 1.5.0 (Fixed InvalidSchema error for connections)
+Version: 1.6.0 (Fix Ambari YAML structure)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -172,15 +172,13 @@ def task_validate_input(**context) -> Dict[str, Any]:
     # Build the YAML config dictionary
     yaml_config = validated_config["yaml_config"]
     
-    # --- NEW: Add ambari section ---
-    yaml_config["ambari"] = {
-        "host": ambari_config.get("host"),
-        "user": ambari_config.get("user"),
-        "password": ambari_config.get("password"),
-        "cluster": ambari_config.get("cluster"),
-        "timeout": ambari_config.get("timeout")
-    }
-    # --- END NEW ---
+    # --- MODIFIED: Add ambari fields as top-level keys ---
+    yaml_config["ambari_host"] = ambari_config.get("host")
+    yaml_config["ambari_user"] = ambari_config.get("user")
+    yaml_config["ambari_password"] = ambari_config.get("password")
+    yaml_config["ambari_cluster"] = ambari_config.get("cluster")
+    yaml_config["ambari_timeout"] = ambari_config.get("timeout")
+    # --- END MODIFIED ---
     
     yaml_config["bootstrap_servers"] = bootstrap_servers
     yaml_config["opentsdb_url"] = opentsdb_url
@@ -509,9 +507,9 @@ def task_generate_report(**context) -> None:
     print(f"    - Action:   {runner_kwargs.get('action', 'N/A').upper()}")
     print("")
     print("  Configuration:")
-    # --- NEW: Added ambari_host to report ---
-    print(f"    - ambari_host: {yaml_config.get('ambari', {}).get('host', 'N/A')}")
-    # --- END NEW ---
+    # --- MODIFIED: Updated ambari_host in report ---
+    print(f"    - ambari_host: {yaml_config.get('ambari_host', 'N/A')}")
+    # --- END MODIFIED ---
     print(f"    - bootstrap_servers: {yaml_config.get('bootstrap_servers', 'N/A')}")
     print(f"    - opentsdb_url: {yaml_config.get('opentsdb_url', 'N/A')}")
     if yaml_config.get('state_directory'):
