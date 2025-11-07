@@ -40,12 +40,6 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-# --- MODIFIED: Removed Salt Variable.get() lines ---
-# SALT_MASTER_URL = Variable.get(...)
-# SALT_API_USERNAME = Variable.get(...)
-# SALT_API_PASSWORD = Variable.get(...)
-# SALT_EAUTH = Variable.get(...)
-
 # --- NEW: Airflow Connection ID ---
 SALT_CONN_ID = "salt_api_default"
 # --- END NEW ---
@@ -214,10 +208,25 @@ def task_validate_input(**context) -> Dict[str, Any]:
     # --- END MODIFIED ---
 
 
-    # 1. Topic name
-    is_valid, error = validate_topic_name(config.get("topic_name", ""))
-    if not is_valid:
-        errors.append(f"Topic name: {error}")
+    # --- MODIFIED: Validate comma-separated topic names ---
+    # 1. Topic name (modified to handle comma-separated list)
+    topic_name_string = config.get("topic_name", "")
+    
+    if not topic_name_string:
+        errors.append("Topic name cannot be empty")
+    else:
+        # Split the string by commas and strip whitespace
+        topic_list = [topic.strip() for topic in topic_name_string.split(',') if topic.strip()]
+        
+        if not topic_list:
+            errors.append("Topic name string was provided but contained no valid topics.")
+        
+        # Now, validate each topic individually
+        for individual_topic in topic_list:
+            is_valid, error = validate_topic_name(individual_topic)
+            if not is_valid:
+                errors.append(f"Invalid topic '{individual_topic}': {error}")
+    # --- END MODIFIED ---
 
     # 2. Bootstrap servers
     bootstrap_servers = config.get("bootstrap_servers", [])
@@ -256,7 +265,7 @@ def task_validate_input(**context) -> Dict[str, Any]:
         raise AirflowException(error_msg)
 
     logger.info("✓ All syntax validations passed")
-    logger.info(f"Topic: {config['topic_name']}")
+    logger.info(f"Topic(s): {config['topic_name']}")
     logger.info(f"OpenTSDB URL: {config['opentsdb_url']}") # MODIFIED: Updated log
     logger.info(f"Target Partitions: {config['alteration']['partitions'].get('target', 'N/A')}")
     logger.info(f"New Retention: {config['alteration']['retention'].get('new', 'N/A')}")
@@ -617,7 +626,7 @@ def task_generate_report(**context) -> None:
     print("║" + " KAFKA TOPIC ALTERATION REPORT ".center(78) + "║")
     print("╚" + "=" * 78 + "╝")
     print("")
-    print(f"  Topic Name: {topic_name}")
+    print(f"  Topic Name(s): {topic_name}")
     print(f"  Bootstrap Servers: {len(validated_config.get('bootstrap_servers', []))}")
     # --- MODIFIED: Added opentsdb_url to report ---
     if validated_config.get("opentsdb_url"):
@@ -683,14 +692,18 @@ dag = DAG(
     params={
         # ==================== Topic Identification ====================
         # Salt params are now fetched from connection 'salt_api_default'
+        
+        # --- MODIFIED: Removed 'pattern' to allow comma-separated lists ---
         "topic_name": Param(
             type="string",
-            title="Topic Name",
-            description="Name of the existing topic to alter",
+            title="Topic Name(s)",
+            description="Name of the existing topic to alter (can be a comma-separated list)",
             minLength=1,
             maxLength=249,
-            pattern="^[a-zA-Z0-9._-]+$",
+            # 'pattern' was removed to allow 'topic1,topic2'
         ),
+        # --- END MODIFIED ---
+
         "bootstrap_servers": Param(
             default=["stg-hdpashique101.phonepe.nb6:6667"],
             type="array",
