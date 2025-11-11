@@ -13,7 +13,7 @@ Tasks:
 6. generate_report - Creates final report
 
 Author: DevOps Team
-Version: 3.0.0 (Moved Salt credentials to connection)
+Version: 3.1.0 (Added Slack alerting on failure)
 Compatible with: Airflow 3.0+, Salt 3000+, Kafka 2.8.2
 """
 
@@ -38,14 +38,9 @@ logger = logging.getLogger(__name__)
 # Configuration Constants
 # ============================================================================
 
-# --- MODIFIED: Removed Salt Variable.get() lines ---
-# SALT_MASTER_URL = Variable.get(...)
-# SALT_API_USERNAME = Variable.get(...)
-# SALT_API_PASSWORD = Variable.get(...)
-# SALT_EAUTH = Variable.get(...)
-
-# --- NEW: Airflow Connection ID ---
+# --- NEW: Airflow Connection IDs ---
 SALT_CONN_ID = "salt_api_default"
+SLACK_CONN_ID = "slack_webhook_default"  # <-- ADDED FOR SLACK ALERTS
 # --- END NEW ---
 
 DAC_TASK_TYPE = "topic_creation"
@@ -136,6 +131,74 @@ def validate_numeric_value(value: Any, name: str, min_val: int = 1, max_val: Opt
         return False, f"{name} exceeds maximum of {max_val}"
 
     return True, ""
+
+
+# --- NEW: SLACK ALERTING FUNCTION ---
+def _send_slack_alert_on_failure(context: Dict[str, Any]):
+    """
+    Custom failure callback function that sends a formatted Slack alert.
+    Fetches the webhook URL from the 'slack_webhook_default' connection.
+    """
+    logger.info(f"Task failed, initiating Slack alert notification...")
+    
+    try:
+        # --- 1. Get Slack Connection ---
+        logger.info(f"Fetching Slack webhook from connection: {SLACK_CONN_ID}")
+        slack_conn = BaseHook.get_connection(SLACK_CONN_ID)
+        
+        # Assumes 'Extra' field contains: {"webhook_url": "https://hooks.slack.com/services/..."}
+        slack_url = slack_conn.extra_dejson.get("webhook_url")
+        
+        if not slack_url:
+            logger.error(f"Slack Connection '{SLACK_CONN_ID}' is missing 'webhook_url' in 'Extra' field.")
+            logger.error("Please set 'Extra' to: {\"webhook_url\": \"YOUR_SECRET_URL\"}")
+            return  # Do not fail the callback, just log the error
+
+        # --- 2. Get Task Info from Context ---
+        ti = context.get("task_instance")
+        dag_run = context.get("dag_run")
+        
+        dag_id = ti.dag_id
+        task_id = ti.task_id
+        log_url = ti.log_url
+        run_id = dag_run.run_id if dag_run else "N/A"
+        
+        # Get the exception that caused the failure
+        exception = context.get('exception')
+        if isinstance(exception, AirflowException):
+            error_message = str(exception)
+        else:
+            error_message = str(exception)
+        
+        # Clean up the message for Slack (removes newlines)
+        error_message = error_message.replace("\n", " ").replace("\r", " ")
+
+        # --- 3. Build Slack Message ---
+        # Using Slack's 'mrkdwn' for formatting
+        message = f"""
+        :airflow-fail: *Airflow Task Failed*
+        > *DAG:* `{dag_id}`
+        > *Task:* `{task_id}`
+        > *Run ID:* `{run_id}`
+        > *Error:* ```{error_message}```
+        > *<{log_url}|View Task Log>*
+        """
+        
+        payload = {"text": message}
+        headers = {"Content-type": "application/json"}
+
+        # --- 4. Send Alert ---
+        response = requests.post(slack_url, data=json.dumps(payload), headers=headers, timeout=10)
+        response.raise_for_status()  # Raise HTTPError for bad responses (4xx, 5xx)
+
+        logger.info(f"Successfully sent Slack alert for task: {task_id}")
+
+    except Exception as e:
+        # Log the error from the callback itself, but don't raise an exception
+        # as this would obscure the original task failure.
+        logger.error(f"ERROR: Failed to send Slack alert on task failure: {e}")
+        logger.error(f"Original exception was: {context.get('exception')}")
+# --- END OF SLACK FUNCTION ---
 
 
 # ============================================================================
@@ -332,7 +395,7 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
         # This forces the http:// prefix regardless of Conn Type
         api_url = f"http://{salt_conn.host}:{salt_conn.port}/run"
         # --- END MODIFICATION ---
-          
+        
         salt_api_username = salt_conn.login
         salt_api_password = salt_conn.password
         # Get eauth from 'Extras' field, default to 'pam'
@@ -408,6 +471,7 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
                         print("\n--- Precheck Script Output (Failure) ---")
                         _log_multiline(script_output)
                         print("------------------------------------------\n")
+                    # THIS EXCEPTION WILL TRIGGER THE SLACK ALERT
                     raise AirflowException(f"Topic pre-checks failed: {error_msg}")
                 
                 logger.info("✓ Topic pre-checks passed successfully.")
@@ -421,7 +485,7 @@ def _execute_salt_task(dry_run: bool, **context) -> Dict[str, Any]:
                     logger.error(f"Failed to parse precheck response: {e}")
                     raise AirflowException(f"Failed to parse precheck response: {str(e)}")
                 else:
-                    raise e
+                    raise e # Re-raise the AirflowException from the precheck failure
 
         return result
 
@@ -499,6 +563,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
                 _log_multiline(script_output)
                 print("-------------------------------\n")
             
+            # THIS EXCEPTION WILL TRIGGER THE SLACK ALERT
             raise AirflowException(f"Topic creation failed: {verification_result['message']}")
 
         context["task_instance"].xcom_push(key="verification_result", value=verification_result)
@@ -508,7 +573,7 @@ def task_verify_result(**context) -> Dict[str, Any]:
         logger.error(f"Unexpected error parsing Salt response: {e}")
         logger.error(f"Full Salt result: {json.dumps(salt_result, indent=2)}")
         if not isinstance(e, AirflowException):
-            raise AirFlowException(f"Failed to verify Salt execution: {str(e)}")
+            raise AirflowException(f"Failed to verify Salt execution: {str(e)}")
         else:
             raise e
 
@@ -517,9 +582,13 @@ def task_verify_result(**context) -> Dict[str, Any]:
 # Task 6: Generate Report
 # ============================================================================
 
+# ============================================================================
+# Task 6: Generate Report (AND SEND SUCCESS ALERT)
+# ============================================================================
+
 def task_generate_report(**context) -> None:
     """
-    Task 6: Generate final execution report.
+    Task 6: Generate final execution report and send success alert.
     """
     logger.info("=" * 80)
     logger.info("TASK 6: Generate Final Report")
@@ -533,11 +602,14 @@ def task_generate_report(**context) -> None:
 
     if not validated_config:
         logger.warning("Could not retrieve validated_config for report.")
-        return
-        
+        # Even if config is missing, we might have a verification_result
+        # that shows a failure, so we don't return here.
+        validated_config = {} # Set to empty dict to avoid errors below
+
     if not verification_result:
+        # This can happen if verify_result fails and is skipped
         logger.error("Could not retrieve verification_result. Task must have failed.")
-        verification_result = {"success": False, "message": "Task failed, check 'verify_result' logs."}
+        verification_result = {"success": False, "message": "Task failed before verification."}
 
     topic_name = validated_config.get("topic_name", "unknown")
     partitions = validated_config.get("partitions", 0)
@@ -558,8 +630,8 @@ def task_generate_report(**context) -> None:
     print("║" + " KAFKA TOPIC CREATION REPORT ".center(78) + "║")
     print("╚" + "=" * 78 + "╝")
     print("")
-    print(f"  Topic Name:         {topic_name}")
-    print(f"  Partitions:         {partitions}")
+    print(f"  Topic Name:        {topic_name}")
+    print(f"  Partitions:        {partitions}")
     print(f"  Replication Factor: {rf}")
     print(f"  Bootstrap Servers:  {validated_config.get('bootstrap_servers', [])}")
     print("")
@@ -580,7 +652,7 @@ def task_generate_report(**context) -> None:
     print("")
     print("─" * 80)
     print("")
-    print(f"  Status:             {'✓ SUCCESS' if verification_result['success'] else '✗ FAILED'}")
+    print(f"  Status:            {'✓ SUCCESS' if verification_result['success'] else '✗ FAILED'}")
     print(f"  Message:            {verification_result['message']}")
     print(f"  Executed On:        {verification_result.get('minion_id', 'N/A')}")
     print("")
@@ -600,6 +672,46 @@ def task_generate_report(**context) -> None:
     print(f"Report generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("═" * 80)
 
+    # --- NEW: Send Success Notification to Slack ---
+    # This task runs on "all_done", so we MUST check if the previous task
+    # (verify_result) actually succeeded.
+    if verification_result and verification_result.get("success", False):
+        try:
+            logger.info("Sending success notification to Slack...")
+            
+            # 1. Get Slack Connection
+            slack_conn = BaseHook.get_connection(SLACK_CONN_ID)
+            slack_url = slack_conn.extra_dejson.get("webhook_url")
+            
+            if not slack_url:
+                logger.warning(f"Cannot send Slack success alert. Connection '{SLACK_CONN_ID}' is missing 'webhook_url' in 'Extra' field.")
+                return # Exit the function
+
+            # 2. Build Message
+            # (Get details from variables already pulled for the report)
+            success_message = f"✅ *Kafka Topic Created Successfully*\n> *Topic:* `{topic_name}`\n> *Partitions:* {partitions}\n> *Replication Factor:* {rf}"
+            
+            payload = {"text": success_message}
+            headers = {"Content-type": "application/json"}
+
+            # 3. Send
+            response = requests.post(
+                slack_url, 
+                data=json.dumps(payload), 
+                headers=headers, 
+                timeout=10
+            )
+            response.raise_for_status()
+            logger.info("Successfully sent success alert to Slack.")
+
+        except Exception as e:
+            # Do not fail the task, just log a warning.
+            logger.warning(f"Failed to send success Slack notification (task still succeeded): {e}")
+    elif not verification_result:
+        logger.warning("Skipping success alert: verification_result XCom not found.")
+    else:
+        logger.info("Skipping success alert: Task did not succeed.")
+    # --- End of Slack Notification ---
 
 # ============================================================================
 # DAG Definition
@@ -613,6 +725,7 @@ default_args = {
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
+    "on_failure_callback": _send_slack_alert_on_failure, # <-- ADDED FOR SLACK
 }
 
 dag = DAG(
@@ -641,7 +754,7 @@ dag = DAG(
         ),
         "replication_factor": Param(
             type="integer",
-            title="Replication Factor (Mandatory)",
+            title="Replication Factor (MandATORY)",
             description="Number of replicas per partition (typically 3 for production)",
             minimum=1,
         ),
